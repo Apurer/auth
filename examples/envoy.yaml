@@ -1,0 +1,130 @@
+static_resources:
+  listeners:
+    - name: https
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 8443}
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_params: {tls_minimum_protocol_version: TLSv1_2}
+                tls_certificates:
+                  - certificate_chain: {filename: /run/secrets/service-cert.pem}
+                    private_key: {filename: /run/secrets/service-key.pem}
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                use_remote_address: true
+                xff_num_trusted_hops: 0
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: REJECT_REQUEST
+                route_config:
+                  name: services
+                  virtual_hosts:
+                    - name: protected
+                      domains: ["*"]
+                      routes:
+                        - match: {prefix: /orders/}
+                          route: {cluster: orders}
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions: {policy_id: orders}
+                        - match: {prefix: /reports/}
+                          route: {cluster: reports}
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              check_settings:
+                                context_extensions: {policy_id: reports}
+                        - match: {prefix: /}
+                          direct_response: {status: 403}
+                http_filters:
+                  # Strip every reserved client identity header BEFORE auth.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          function envoy_on_request(handle)
+                            local remove = {}
+                            for key, value in pairs(handle:headers()) do
+                              if string.sub(key, 1, 7) == "x-auth-" then
+                                table.insert(remove, key)
+                              end
+                            end
+                            for _, key in ipairs(remove) do
+                              handle:headers():remove(key)
+                            end
+                          end
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      failure_mode_allow: false
+                      status_on_error: {code: ServiceUnavailable}
+                      clear_route_cache: false
+                      validate_mutations: true
+                      encode_raw_headers: true
+                      allowed_headers:
+                        patterns:
+                          - exact: authorization
+                      grpc_service:
+                        envoy_grpc: {cluster_name: ad-auth}
+                        timeout: 2s
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: ad-auth
+      connect_timeout: 0.25s
+      type: STATIC
+      http2_protocol_options: {}
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: auth.example.com
+          common_tls_context:
+            tls_params: {tls_minimum_protocol_version: TLSv1_2}
+            tls_certificates:
+              - certificate_chain: {filename: /run/secrets/envoy-cert.pem}
+                private_key: {filename: /run/secrets/envoy-key.pem}
+            validation_context:
+              trusted_ca: {filename: /run/secrets/auth-ca.pem}
+              match_typed_subject_alt_names:
+                - san_type: DNS
+                  matcher: {exact: auth.example.com}
+      load_assignment:
+        cluster_name: ad-auth
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 9001}
+    - name: orders
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: orders
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 8080}
+    - name: reports
+      connect_timeout: 1s
+      type: STATIC
+      load_assignment:
+        cluster_name: reports
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: 127.0.0.1, port_value: 8081}

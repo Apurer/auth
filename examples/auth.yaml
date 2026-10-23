@@ -1,0 +1,47 @@
+version: v1
+listen: 127.0.0.1:9001
+admin_listen: 127.0.0.1:9002
+mode: group_policy
+tls:
+  certificate: /run/secrets/auth-cert.pem
+  private_key: /run/secrets/auth-key.pem
+  client_ca: /run/secrets/envoy-client-ca.pem
+  allowed_client_sans: [envoy.example.com]
+directory:
+  endpoints:
+    - ldaps://dc1.example.com:636
+    - ldaps://dc2.example.com:636
+  ca_file: /run/secrets/ad-ca.pem
+  user_base: DC=example,DC=com
+  group_base: DC=example,DC=com
+  domain_sid: S-1-5-21-111111111-222222222-333333333
+  netbios: EXAMPLE
+  upn_suffixes: [example.com]
+  allow_bare_username: true
+  reader_dn: CN=envoy-reader,OU=Service Accounts,DC=example,DC=com
+  reader_password_file: /run/secrets/ad-reader-password
+# Resolve the real SIDs with Get-ADGroup (see README).
+# A user must be a member of at least one any_of group. Nested groups count.
+policies:
+  orders:
+    any_of:
+      - S-1-5-21-111111111-222222222-333333333-1101
+      - S-1-5-21-111111111-222222222-333333333-1102
+  reports:
+    any_of:
+      - S-1-5-21-111111111-222222222-333333333-1103
+# Only these groups are exported upstream. Authorization uses the full result.
+export_groups:
+  - S-1-5-21-111111111-222222222-333333333-1101
+  - S-1-5-21-111111111-222222222-333333333-1102
+  - S-1-5-21-111111111-222222222-333333333-1103
+limits:
+  timeout: 1800ms
+  max_concurrent: 16
+  max_groups: 2048
+  max_credential_bytes: 8192
+  max_identity_bytes: 8192
+  global_per_minute: 600
+  source_per_minute: 120
+  account_per_minute: 30
+  max_rate_keys: 10000
