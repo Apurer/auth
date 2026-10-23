@@ -1,6 +1,6 @@
 module github.com/Apurer/auth
 
-go 1.26.10
+go 1.27.3
 
 require (
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
