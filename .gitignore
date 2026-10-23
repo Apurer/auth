@@ -1,0 +1,7 @@
+/bin/
+/coverage.out
+/secrets/
+*.key
+*.pem
+*.pfx
+*.test

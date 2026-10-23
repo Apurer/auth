@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          check-latest: true
+          cache: true
+      - name: Formatting and static analysis
+        run: |
+          test -z "$(gofmt -l cmd internal integration)"
+          go vet ./...
+      - name: Unit and transport tests
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Download pinned Envoy
+        run: |
+          curl --fail --location --retry 3 https://github.com/envoyproxy/envoy/releases/download/v1.40.0/envoy-1.40.0-linux-x86_64 -o "$RUNNER_TEMP/envoy"
+          echo "8aa137a7d00994ce43f613556f5a120709229f63bedb86eedde5ccbc402c2b80  $RUNNER_TEMP/envoy" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/envoy"
+      - name: Real Envoy integration
+        run: ENVOY_BINARY="$RUNNER_TEMP/envoy" go test -race ./integration -run TestEnvoy -v
+      - name: Dependency vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Build container
+        run: docker build -t envoy-ad-auth:test .
