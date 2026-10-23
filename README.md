@@ -42,7 +42,7 @@ The complete [Envoy example](examples/envoy.yaml) protects `/orders/` and `/repo
 
 ## Build and run
 
-Use Go 1.26 or later with current security patches:
+Use Go 1.26.10 or a newer supported release with current security patches:
 
 ```sh
 go mod download
