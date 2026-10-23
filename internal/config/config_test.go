@@ -51,13 +51,13 @@ func TestPolicySemantics(t *testing.T) {
 		groups []string
 		want   bool
 	}{
-		{"one allowed", Policy{AnyOf: []string{"a", "b"}}, []string{"b"}, true},
-		{"nested result allowed", Policy{AnyOf: []string{"a"}}, []string{"child", "a"}, true},
-		{"none allowed", Policy{AnyOf: []string{"a"}}, []string{"other"}, false},
-		{"all required", Policy{AllOf: []string{"a", "b"}}, []string{"a"}, false},
-		{"all matched", Policy{AllOf: []string{"a", "b"}}, []string{"b", "a"}, true},
-		{"deny precedence", Policy{AnyOf: []string{"a"}, DenyAnyOf: []string{"blocked"}}, []string{"a", "blocked"}, false},
-		{"all and any", Policy{AnyOf: []string{"a"}, AllOf: []string{"b"}}, []string{"a"}, false},
+		{"one allowed", Policy{AnyOf: SIDs("a", "b")}, []string{"b"}, true},
+		{"nested result allowed", Policy{AnyOf: SIDs("a")}, []string{"child", "a"}, true},
+		{"none allowed", Policy{AnyOf: SIDs("a")}, []string{"other"}, false},
+		{"all required", Policy{AllOf: SIDs("a", "b")}, []string{"a"}, false},
+		{"all matched", Policy{AllOf: SIDs("a", "b")}, []string{"b", "a"}, true},
+		{"deny precedence", Policy{AnyOf: SIDs("a"), DenyAnyOf: SIDs("blocked")}, []string{"a", "blocked"}, false},
+		{"all and any", Policy{AnyOf: SIDs("a"), AllOf: SIDs("b")}, []string{"a"}, false},
 		{"authenticated", Policy{AllowAuthenticated: true}, nil, true},
 		{"empty denied", Policy{}, nil, false},
 	} {

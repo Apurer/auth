@@ -42,6 +42,14 @@ func TestLiveAD(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.Limits.Timeout)
 	defer cancel()
+	policyID := os.Getenv("AUTH_AD_POLICY")
+	policy, found := c.Policies[policyID]
+	if policyID != "" && !found {
+		t.Fatal("AUTH_AD_POLICY does not exist")
+	}
+	if policyID != "" {
+		ctx = auth.WithGroupRefs(ctx, policy.NamedGroups())
+	}
 	id, err := d.Authenticate(ctx, user, string(password), func(string) bool { return true })
 	if err != nil {
 		t.Fatal("live AD authentication or group resolution failed")
@@ -50,5 +58,8 @@ func TestLiveAD(t *testing.T) {
 		if !slices.Contains(id.Groups, sid) {
 			t.Error("an expected fixture group was not returned")
 		}
+	}
+	if policyID != "" && !policy.Allows(id.Groups, id.ResolvedGroups) {
+		t.Error("live AD fixture failed the selected policy")
 	}
 }

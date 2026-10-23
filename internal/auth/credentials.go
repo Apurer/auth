@@ -80,5 +80,8 @@ func ParseUsername(name string, d config.Directory) (Username, error) {
 	if !d.AllowBareUsername {
 		return Username{}, ErrCredentials
 	}
+	if d.Domain != "" && d.EffectiveBindMode() == "user" {
+		return Username{"userPrincipalName", name + "@" + d.Domain}, nil
+	}
 	return Username{"sAMAccountName", name}, nil
 }
