@@ -23,8 +23,9 @@ import (
 )
 
 type Identity struct {
-	SID, UPN string
-	Groups   []string
+	SID, UPN       string
+	Groups         []string
+	ResolvedGroups map[string]string
 }
 
 type Directory interface {
@@ -145,7 +146,7 @@ func (s *Service) Check(ctx context.Context, req *authv3.CheckRequest) (resp *au
 	}
 	s.inflight.Inc()
 	defer s.inflight.Dec()
-	identity, authErr := snap.Directory.Authenticate(ctx, u, password, func(sid string) bool { return s.admission.Allow("account", sid, c.Limits.AccountPerMinute) })
+	identity, authErr := snap.Directory.Authenticate(WithGroupRefs(ctx, policy.NamedGroups()), u, password, func(sid string) bool { return s.admission.Allow("account", sid, c.Limits.AccountPerMinute) })
 	if authErr != nil {
 		switch {
 		case errors.Is(authErr, ErrCredentials):
@@ -176,7 +177,11 @@ func (s *Service) Check(ctx context.Context, req *authv3.CheckRequest) (resp *au
 			return deny(503, "authentication service unavailable", false), nil
 		}
 	}
-	if c.Mode == "group_policy" && !policy.Allows(groups) {
+	if c.Mode == "group_policy" && !policy.ValidateResolved(identity.ResolvedGroups) {
+		outcome = "directory_error"
+		return deny(503, "authentication service unavailable", false), nil
+	}
+	if c.Mode == "group_policy" && !policy.Allows(groups, identity.ResolvedGroups) {
 		outcome = "forbidden"
 		return deny(403, "access denied", false), nil
 	}

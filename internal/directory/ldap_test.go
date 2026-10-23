@@ -19,17 +19,28 @@ const primarySID = domain + "-513"
 const allowedSID = domain + "-1101"
 
 type fakeConn struct {
-	bindErr   error
-	binds     int
-	requests  []*ldap.SearchRequest
-	results   []*ldap.SearchResult
-	searchErr error
-	closed    chan struct{}
-	once      sync.Once
-	block     bool
+	bindErr    error
+	bindErrors []error
+	bindNames  []string
+	binds      int
+	requests   []*ldap.SearchRequest
+	results    []*ldap.SearchResult
+	searchErr  error
+	closed     chan struct{}
+	once       sync.Once
+	block      bool
 }
 
-func (c *fakeConn) Bind(string, string) error { c.binds++; return c.bindErr }
+func (c *fakeConn) Bind(name string, _ string) error {
+	c.binds++
+	c.bindNames = append(c.bindNames, name)
+	if len(c.bindErrors) > 0 {
+		e := c.bindErrors[0]
+		c.bindErrors = c.bindErrors[1:]
+		return e
+	}
+	return c.bindErr
+}
 func (c *fakeConn) Search(r *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	c.requests = append(c.requests, r)
 	if c.block {

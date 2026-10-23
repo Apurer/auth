@@ -41,6 +41,9 @@ func run(path string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if snap.Config.Directory.TLS.InsecureSkipVerify {
+		logger.Warn("AD server certificate verification is disabled by configuration")
+	}
 	svc := auth.New(snap, registry, logger)
 	server, err := transport.Server(snap.Config)
 	if err != nil {
@@ -126,6 +129,9 @@ func run(path string, logger *slog.Logger) error {
 				continue
 			}
 			healthy.Store(next)
+			if next.Config.Directory.TLS.InsecureSkipVerify {
+				logger.Warn("AD server certificate verification is disabled by configuration")
+			}
 			logger.Info("configuration reloaded", "config_version", next.Config.Version)
 		}
 	}

@@ -53,20 +53,19 @@ func NewMetrics(r prometheus.Registerer) *Metrics {
 }
 
 func New(c config.Directory, maxGroups int, m *Metrics) (*LDAP, error) {
-	ca, err := os.ReadFile(c.CAFile)
+	tlsConfig, err := directoryTLS(c)
 	if err != nil {
-		return nil, errors.New("cannot read directory CA")
+		return nil, err
 	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(ca) {
-		return nil, errors.New("invalid directory CA")
+	d := &LDAP{c: c, maxGroups: maxGroups, metrics: m}
+	if c.EffectiveBindMode() == "reader" {
+		password, err := os.ReadFile(c.ReaderPasswordFile)
+		if err != nil || len(password) == 0 {
+			return nil, errors.New("cannot read nonempty reader password")
+		}
+		d.password = string(password)
+		clear(password)
 	}
-	password, err := os.ReadFile(c.ReaderPasswordFile)
-	if err != nil || len(password) == 0 {
-		return nil, errors.New("cannot read nonempty reader password")
-	}
-	d := &LDAP{c: c, maxGroups: maxGroups, password: string(password), metrics: m}
-	clear(password)
 	d.dial = func(ctx context.Context, endpoint string) (connection, error) {
 		u, _ := url.Parse(endpoint)
 		port := u.Port()
@@ -77,7 +76,9 @@ func New(c config.Directory, maxGroups int, m *Metrics) (*LDAP, error) {
 		if err != nil {
 			return nil, auth.ErrDirectory
 		}
-		secure := tls.Client(tcp, &tls.Config{RootCAs: roots, ServerName: u.Hostname(), MinVersion: tls.VersionTLS12})
+		tc := tlsConfig.Clone()
+		tc.ServerName = u.Hostname()
+		secure := tls.Client(tcp, tc)
 		if err = secure.HandshakeContext(ctx); err != nil {
 			tcp.Close()
 			return nil, auth.ErrDirectory
@@ -87,6 +88,25 @@ func New(c config.Directory, maxGroups int, m *Metrics) (*LDAP, error) {
 		return conn, nil
 	}
 	return d, nil
+}
+
+func directoryTLS(c config.Directory) (*tls.Config, error) {
+	tc := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: c.TLS.InsecureSkipVerify} // Explicit operator opt-in; never inferred from CA absence.
+	if path := c.EffectiveCAFile(); path != "" {
+		ca, err := os.ReadFile(path)
+		if err != nil {
+			return nil, errors.New("cannot read directory CA")
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(ca) {
+			return nil, errors.New("invalid directory CA")
+		}
+		tc.RootCAs = roots
+	}
+	return tc, nil
 }
 
 func (d *LDAP) record(phase string, start time.Time, err error) {
@@ -109,8 +129,8 @@ func attach(ctx context.Context, c connection) func() {
 	return func() { stop(); c.Close() }
 }
 
-// connectReader fails over only connection setup, before a bind is submitted.
-func (d *LDAP) connectReader(ctx context.Context) (connection, string, func(), error) {
+// connect fails over only connection setup, before a bind is submitted.
+func (d *LDAP) connect(ctx context.Context) (connection, string, func(), error) {
 	start := int(d.next.Add(1)-1) % len(d.c.Endpoints)
 	for i := 0; i < len(d.c.Endpoints); i++ {
 		endpoint := d.c.Endpoints[(start+i)%len(d.c.Endpoints)]
@@ -125,20 +145,32 @@ func (d *LDAP) connectReader(ctx context.Context) (connection, string, func(), e
 			continue
 		}
 		cleanup := attach(ctx, conn)
-		t := time.Now()
-		err = conn.Bind(d.c.ReaderDN, d.password)
-		d.record("reader_bind", t, err)
-		if err != nil {
-			cleanup()
-			return nil, "", nil, auth.ErrDirectory
-		}
 		return conn, endpoint, cleanup, nil
 	}
 	return nil, "", nil, auth.ErrDirectory
 }
 
+func (d *LDAP) connectReader(ctx context.Context) (connection, string, func(), error) {
+	conn, endpoint, cleanup, err := d.connect(ctx)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	t := time.Now()
+	err = conn.Bind(d.c.ReaderDN, d.password)
+	d.record("reader_bind", t, err)
+	if err != nil {
+		cleanup()
+		return nil, "", nil, auth.ErrDirectory
+	}
+	return conn, endpoint, cleanup, nil
+}
+
 func (d *LDAP) Probe(ctx context.Context) error {
-	_, _, close, err := d.connectReader(ctx)
+	connect := d.connectReader
+	if d.c.EffectiveBindMode() == "user" {
+		connect = d.connect
+	}
+	_, _, close, err := connect(ctx)
 	if err != nil {
 		return auth.ErrDirectory
 	}
@@ -166,13 +198,48 @@ func (d *LDAP) Authenticate(ctx context.Context, u auth.Username, password strin
 	if u.Attribute != "sAMAccountName" && u.Attribute != "userPrincipalName" {
 		return auth.Identity{}, auth.ErrCredentials
 	}
-	reader, endpoint, cleanup, err := d.connectReader(ctx)
+	userMode := d.c.EffectiveBindMode() == "user"
+	connect := d.connectReader
+	if userMode {
+		connect = d.connect
+	}
+	reader, endpoint, cleanup, err := connect(ctx)
 	if err != nil {
 		return auth.Identity{}, err
 	}
 	defer cleanup()
+	if userMode {
+		principal := u.Value
+		if u.Attribute == "sAMAccountName" {
+			principal = u.Value + "@" + d.c.Domain
+		}
+		t := time.Now()
+		err = reader.Bind(principal, password)
+		d.record("user_bind", t, err)
+		if err != nil {
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+				return auth.Identity{}, auth.ErrCredentials
+			}
+			return auth.Identity{}, auth.ErrDirectory
+		}
+	}
+	meta, err := d.discover(reader, userMode || d.c.Domain != "")
+	if err != nil {
+		return auth.Identity{}, err
+	}
 	filter := "(&(objectCategory=person)(objectClass=user)(" + u.Attribute + "=" + ldap.EscapeFilter(u.Value) + "))"
-	r, err := d.search(reader, d.c.UserBase, ldap.ScopeWholeSubtree, filter, []string{"objectSid", "objectGUID", "userPrincipalName", "primaryGroupID", "sIDHistory"}, 2, "user_lookup")
+	if userMode {
+		name := u.Value
+		if u.Attribute == "userPrincipalName" {
+			name, _, _ = strings.Cut(u.Value, "@")
+		}
+		principal := u.Value
+		if u.Attribute == "sAMAccountName" {
+			principal = name + "@" + d.c.Domain
+		}
+		filter = "(&(objectCategory=person)(objectClass=user)(|(userPrincipalName=" + ldap.EscapeFilter(principal) + ")(sAMAccountName=" + ldap.EscapeFilter(name) + ")))"
+	}
+	r, err := d.search(reader, meta.userBase, ldap.ScopeWholeSubtree, filter, []string{"objectSid", "objectGUID", "userPrincipalName", "primaryGroupID", "sIDHistory"}, 2, "user_lookup")
 	if err != nil {
 		return auth.Identity{}, err
 	}
@@ -186,27 +253,44 @@ func (d *LDAP) Authenticate(ctx context.Context, u auth.Username, password strin
 	sid, err := DecodeSID(user.GetRawAttributeValue("objectSid"))
 	guid := user.GetRawAttributeValue("objectGUID")
 	upn := user.GetAttributeValue("userPrincipalName")
-	if err != nil || len(guid) != 16 || upn == "" || !strings.HasPrefix(sid, d.c.DomainSID+"-") || len(strings.Split(sid, "-")) != 8 || len(user.GetRawAttributeValues("sIDHistory")) > 0 {
+	if err != nil || len(guid) != 16 || upn == "" || !strings.HasPrefix(sid, meta.domainSID+"-") || len(strings.Split(sid, "-")) != 8 || len(user.GetRawAttributeValues("sIDHistory")) > 0 {
 		return auth.Identity{}, auth.ErrDirectory
 	}
 	if !beforeBind(sid) {
 		return auth.Identity{}, auth.ErrRateLimited
 	}
-	// No failover or retry after credentials are submitted, including ambiguous binds.
-	userConn, err := d.dial(ctx, endpoint)
-	if err != nil {
-		return auth.Identity{}, auth.ErrDirectory
-	}
-	closeUser := attach(ctx, userConn)
-	t := time.Now()
-	err = userConn.Bind(user.DN, password)
-	closeUser()
-	d.record("user_bind", t, err)
-	if err != nil {
-		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
-			return auth.Identity{}, auth.ErrCredentials
+	if userMode {
+		// Confirm the canonical DN after discovery. This prevents UPN aliases or
+		// cross-domain name collisions from authenticating a different object
+		// than the one whose memberships will be used. It is not a retry of a
+		// rejected bind: only a successful first bind can reach this operation.
+		t := time.Now()
+		err = reader.Bind(user.DN, password)
+		d.record("user_bind", t, err)
+		if err != nil {
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+				return auth.Identity{}, auth.ErrCredentials
+			}
+			return auth.Identity{}, auth.ErrDirectory
 		}
-		return auth.Identity{}, auth.ErrDirectory
+	}
+	if !userMode {
+		// Reader mode validates the password using a separate user connection.
+		userConn, err := d.dial(ctx, endpoint)
+		if err != nil {
+			return auth.Identity{}, auth.ErrDirectory
+		}
+		closeUser := attach(ctx, userConn)
+		t := time.Now()
+		err = userConn.Bind(user.DN, password)
+		closeUser()
+		d.record("user_bind", t, err)
+		if err != nil {
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+				return auth.Identity{}, auth.ErrCredentials
+			}
+			return auth.Identity{}, auth.ErrDirectory
+		}
 	}
 	if ctx.Err() != nil {
 		return auth.Identity{}, auth.ErrDirectory
@@ -241,7 +325,7 @@ func (d *LDAP) Authenticate(ctx context.Context, u auth.Username, password strin
 		}
 		groups[g] = b
 	}
-	primary := fmt.Sprintf("%s-%d", d.c.DomainSID, rid)
+	primary := fmt.Sprintf("%s-%d", meta.domainSID, rid)
 	pb, _ := EncodeSID(primary)
 	groups[primary] = pb
 	if len(groups) > d.maxGroups {
@@ -262,7 +346,7 @@ func (d *LDAP) Authenticate(ctx context.Context, u auth.Username, password strin
 			f.WriteString("(objectSid=" + binaryFilter(groups[g]) + ")")
 		}
 		f.WriteString("))")
-		r, err = d.search(reader, d.c.GroupBase, ldap.ScopeWholeSubtree, f.String(), []string{"objectSid", "groupType", "sIDHistory"}, len(batch), "group_validation")
+		r, err = d.search(reader, meta.groupBase, ldap.ScopeWholeSubtree, f.String(), []string{"objectSid", "groupType", "sIDHistory"}, len(batch), "group_validation")
 		if err != nil || len(r.Entries) != len(batch) {
 			return auth.Identity{}, auth.ErrDirectory
 		}
@@ -282,8 +366,15 @@ func (d *LDAP) Authenticate(ctx context.Context, u auth.Username, password strin
 	if ctx.Err() != nil {
 		return auth.Identity{}, auth.ErrDirectory
 	}
+	resolved, err := d.resolveNamed(reader, meta, auth.RequestedGroups(ctx))
+	if err != nil {
+		return auth.Identity{}, err
+	}
+	if ctx.Err() != nil {
+		return auth.Identity{}, auth.ErrDirectory
+	}
 	if d.metrics != nil {
 		d.metrics.groups.Observe(float64(len(all)))
 	}
-	return auth.Identity{SID: sid, UPN: upn, Groups: all}, nil
+	return auth.Identity{SID: sid, UPN: upn, Groups: all, ResolvedGroups: resolved}, nil
 }

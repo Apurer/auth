@@ -56,3 +56,18 @@ func FuzzCredentials(f *testing.F) {
 		}
 	})
 }
+
+func TestSimplifiedUsernameNormalization(t *testing.T) {
+	d := config.Directory{Domain: "example.com", BindMode: "user", AllowBareUsername: true, UPNSuffixes: []string{"example.com"}}
+	u, _, err := ParseCredentials(basic("alice:secret"), d, 8192)
+	if err != nil || u.Attribute != "userPrincipalName" || u.Value != "alice@example.com" {
+		t.Fatal("bare username not normalized", err)
+	}
+	d.AllowBareUsername = false
+	if _, _, err := ParseCredentials(basic("alice:secret"), d, 8192); err == nil {
+		t.Fatal("explicit bare-name disable ignored")
+	}
+	if _, _, err := ParseCredentials(basic(`EXAMPLE\alice:secret`), d, 8192); err == nil {
+		t.Fatal("guessed NetBIOS domain")
+	}
+}

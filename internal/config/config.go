@@ -37,16 +37,41 @@ type TLS struct {
 }
 
 type Directory struct {
-	Endpoints          []string `yaml:"endpoints"`
-	CAFile             string   `yaml:"ca_file"`
-	UserBase           string   `yaml:"user_base"`
-	GroupBase          string   `yaml:"group_base"`
-	DomainSID          string   `yaml:"domain_sid"`
-	NetBIOS            string   `yaml:"netbios"`
-	UPNSuffixes        []string `yaml:"upn_suffixes"`
-	AllowBareUsername  bool     `yaml:"allow_bare_username"`
-	ReaderDN           string   `yaml:"reader_dn"`
-	ReaderPasswordFile string   `yaml:"reader_password_file"`
+	Domain             string       `yaml:"domain"`
+	BindMode           string       `yaml:"bind_mode"`
+	TLS                DirectoryTLS `yaml:"tls"`
+	Endpoints          []string     `yaml:"endpoints"`
+	CAFile             string       `yaml:"ca_file"`
+	UserBase           string       `yaml:"user_base"`
+	GroupBase          string       `yaml:"group_base"`
+	DomainSID          string       `yaml:"domain_sid"`
+	NetBIOS            string       `yaml:"netbios"`
+	UPNSuffixes        []string     `yaml:"upn_suffixes"`
+	AllowBareUsername  bool         `yaml:"allow_bare_username"`
+	ReaderDN           string       `yaml:"reader_dn"`
+	ReaderPasswordFile string       `yaml:"reader_password_file"`
+}
+
+type DirectoryTLS struct {
+	CAFile             string `yaml:"ca_file"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
+}
+
+func (d Directory) EffectiveBindMode() string {
+	if d.BindMode != "" {
+		return d.BindMode
+	}
+	if d.ReaderDN != "" || d.ReaderPasswordFile != "" {
+		return "reader"
+	}
+	return "user"
+}
+
+func (d Directory) EffectiveCAFile() string {
+	if d.TLS.CAFile != "" {
+		return d.TLS.CAFile
+	}
+	return d.CAFile
 }
 
 type Limits struct {
@@ -62,25 +87,41 @@ type Limits struct {
 }
 
 type Policy struct {
-	AnyOf              []string `yaml:"any_of"`
-	AllOf              []string `yaml:"all_of"`
-	DenyAnyOf          []string `yaml:"deny_any_of"`
-	AllowAuthenticated bool     `yaml:"allow_authenticated"`
+	AnyOf              []GroupRef `yaml:"any_of"`
+	AllOf              []GroupRef `yaml:"all_of"`
+	DenyAnyOf          []GroupRef `yaml:"deny_any_of"`
+	AllowAuthenticated bool       `yaml:"allow_authenticated"`
 }
 
-func (p Policy) Allows(groups []string) bool {
-	for _, sid := range p.DenyAnyOf {
+func (p Policy) Allows(groups []string, resolutions ...map[string]string) bool {
+	var resolved map[string]string
+	if len(resolutions) > 0 {
+		resolved = resolutions[0]
+	}
+	if !p.ValidateResolved(resolved) {
+		return false
+	}
+	sidFor := func(g GroupRef) string {
+		if g.SID != "" {
+			return g.SID
+		}
+		return resolved[g.Key()]
+	}
+	for _, ref := range p.DenyAnyOf {
+		sid := sidFor(ref)
 		if slices.Contains(groups, sid) {
 			return false
 		}
 	}
-	for _, sid := range p.AllOf {
+	for _, ref := range p.AllOf {
+		sid := sidFor(ref)
 		if !slices.Contains(groups, sid) {
 			return false
 		}
 	}
 	if len(p.AnyOf) > 0 {
-		for _, sid := range p.AnyOf {
+		for _, ref := range p.AnyOf {
+			sid := sidFor(ref)
 			if slices.Contains(groups, sid) {
 				return true
 			}
@@ -99,7 +140,7 @@ func Load(path string) (*Config, error) {
 }
 
 func Decode(b []byte) (*Config, error) {
-	c := &Config{Listen: "127.0.0.1:9001", AdminListen: "127.0.0.1:9002", Limits: Limits{
+	c := &Config{Listen: "127.0.0.1:9001", AdminListen: "127.0.0.1:9002", Directory: Directory{AllowBareUsername: true}, Limits: Limits{
 		Timeout: 1800 * time.Millisecond, MaxConcurrent: 16, MaxGroups: 2048,
 		MaxCredentialBytes: 8192, MaxIdentityBytes: 8192,
 		GlobalPerMinute: 600, SourcePerMinute: 120, AccountPerMinute: 30, MaxRateKeys: 10000,
@@ -112,6 +153,20 @@ func Decode(b []byte) (*Config, error) {
 	var extra any
 	if err := d.Decode(&extra); err != io.EOF {
 		return nil, errors.New("configuration must contain one YAML document")
+	}
+	c.Directory.Domain = strings.ToLower(c.Directory.Domain)
+	if len(c.Directory.UPNSuffixes) == 0 && c.Directory.Domain != "" {
+		c.Directory.UPNSuffixes = []string{c.Directory.Domain}
+	}
+	for name, p := range c.Policies {
+		for _, list := range [][]GroupRef{p.AnyOf, p.AllOf, p.DenyAnyOf} {
+			for i := range list {
+				if list[i].Name != "" && list[i].Domain == "" {
+					list[i].Domain = c.Directory.Domain
+				}
+			}
+		}
+		c.Policies[name] = p
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -160,13 +215,34 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	if d.CAFile == "" || d.ReaderDN == "" || d.ReaderPasswordFile == "" || d.NetBIOS == "" || len(d.UPNSuffixes) == 0 {
-		return errors.New("directory CA, reader, domain and UPN suffixes are required")
+	if d.EffectiveBindMode() != "user" && d.EffectiveBindMode() != "reader" {
+		return errors.New("bind_mode must be user or reader")
 	}
-	if !ValidSID(d.DomainSID) || len(strings.Split(d.DomainSID, "-")) != 7 || !strings.HasPrefix(d.DomainSID, "S-1-5-21-") {
+	if d.EffectiveBindMode() == "reader" && (d.ReaderDN == "" || d.ReaderPasswordFile == "") {
+		return errors.New("reader mode requires reader_dn and reader_password_file")
+	}
+	if d.EffectiveBindMode() == "user" && (d.ReaderDN != "" || d.ReaderPasswordFile != "") {
+		return errors.New("user mode must not contain reader credentials")
+	}
+	if d.Domain != "" && !ValidDomain(d.Domain) {
+		return errors.New("invalid directory domain")
+	}
+	if (d.EffectiveBindMode() == "user" || d.UserBase == "" || d.GroupBase == "" || d.DomainSID == "") && d.Domain == "" {
+		return errors.New("directory domain is required for user bind or discovery")
+	}
+	if len(d.UPNSuffixes) == 0 {
+		return errors.New("at least one UPN suffix is required")
+	}
+	if d.CAFile != "" && d.TLS.CAFile != "" && d.CAFile != d.TLS.CAFile {
+		return errors.New("conflicting directory CA files")
+	}
+	if d.DomainSID != "" && (!ValidSID(d.DomainSID) || len(strings.Split(d.DomainSID, "-")) != 7 || !strings.HasPrefix(d.DomainSID, "S-1-5-21-")) {
 		return errors.New("domain_sid must be a canonical AD domain SID")
 	}
 	for _, dn := range []string{d.UserBase, d.GroupBase, d.ReaderDN} {
+		if dn == "" {
+			continue
+		}
 		if parsed, err := ldap.ParseDN(dn); err != nil || len(parsed.RDNs) == 0 {
 			return errors.New("invalid directory distinguished name")
 		}
@@ -196,15 +272,18 @@ func (c *Config) Validate() error {
 		if p.AllowAuthenticated && (len(p.AnyOf) > 0 || len(p.AllOf) > 0) {
 			return fmt.Errorf("policy %q mixes allow_authenticated and positive groups", name)
 		}
-		for _, list := range [][]string{p.AnyOf, p.AllOf, p.DenyAnyOf} {
-			for _, sid := range list {
-				if !ValidSID(sid) {
-					return errors.New("policy contains an invalid SID")
+		if len(p.AnyOf)+len(p.AllOf)+len(p.DenyAnyOf) > 256 {
+			return errors.New("policy exceeds 256 group references")
+		}
+		for _, list := range [][]GroupRef{p.AnyOf, p.AllOf, p.DenyAnyOf} {
+			for _, ref := range list {
+				if err := ref.Validate(d.Domain); err != nil {
+					return err
 				}
 			}
 		}
-		for _, sid := range append(slices.Clone(p.AnyOf), p.AllOf...) {
-			if slices.Contains(p.DenyAnyOf, sid) {
+		for _, ref := range append(slices.Clone(p.AnyOf), p.AllOf...) {
+			if slices.ContainsFunc(p.DenyAnyOf, func(deny GroupRef) bool { return ref.Key() == deny.Key() }) {
 				return fmt.Errorf("policy %q has contradictory groups", name)
 			}
 		}
@@ -218,6 +297,23 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func ValidDomain(s string) bool {
+	if len(s) > 253 || !strings.Contains(s, ".") {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func ValidSID(s string) bool {

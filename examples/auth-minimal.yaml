@@ -1,0 +1,19 @@
+version: v1
+mode: group_policy
+# Envoy and auth run as the same UID. Create this directory with mode 0700.
+listen: unix:/run/envoy-ad-auth/auth.sock
+directory:
+  domain: example.com
+  endpoints:
+    - ldaps://dc1.example.com:636
+    - ldaps://dc2.example.com:636
+  # No reader credentials means user-bound authentication.
+  # The OS trust store is used unless tls.ca_file is supplied.
+policies:
+  orders:
+    any_of:
+      - name: Orders Users
+        # domain defaults to directory.domain
+  reports:
+    any_of:
+      - name: Reports Users

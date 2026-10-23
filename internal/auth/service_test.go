@@ -39,7 +39,7 @@ func (d *fakeDirectory) Authenticate(ctx context.Context, u Username, p string, 
 	if !admit(sid) {
 		return Identity{}, ErrRateLimited
 	}
-	return Identity{sid, "alice@example.com", []string{group}}, nil
+	return Identity{SID: sid, UPN: "alice@example.com", Groups: []string{group}}, nil
 }
 func (d *fakeDirectory) Probe(context.Context) error { return nil }
 
@@ -49,7 +49,7 @@ func testService(t *testing.T, d *fakeDirectory) (*Service, *config.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Policies = map[string]config.Policy{"service": {AnyOf: []string{group}}}
+	c.Policies = map[string]config.Policy{"service": {AnyOf: config.SIDs(group)}}
 	c.ExportGroups = []string{group}
 	return New(&Snapshot{Config: c, Directory: d}, prometheus.NewRegistry(), slog.New(slog.NewTextHandler(io.Discard, nil))), c
 }
@@ -113,7 +113,7 @@ func TestDecisionMatrix(t *testing.T) {
 
 func TestForbiddenAndEnrichment(t *testing.T) {
 	s, c := testService(t, &fakeDirectory{})
-	c.Policies["service"] = config.Policy{AnyOf: []string{"S-1-5-32-544"}}
+	c.Policies["service"] = config.Policy{AnyOf: config.SIDs("S-1-5-32-544")}
 	r, _ := s.Check(context.Background(), request(basic("alice:secret")))
 	if httpStatus(r) != 403 {
 		t.Fatal(httpStatus(r))
@@ -256,7 +256,7 @@ func TestInFlightCheckRetainsPolicySnapshot(t *testing.T) {
 	d := &fakeDirectory{fn: func(context.Context, Username, string, func(string) bool) (Identity, error) {
 		close(started)
 		<-release
-		return Identity{sid, "alice@example.com", []string{group}}, nil
+		return Identity{SID: sid, UPN: "alice@example.com", Groups: []string{group}}, nil
 	}}
 	s, c := testService(t, d)
 	done := make(chan *authv3.CheckResponse, 1)
@@ -264,7 +264,7 @@ func TestInFlightCheckRetainsPolicySnapshot(t *testing.T) {
 	<-started
 	next := *c
 	next.Version = "changed"
-	next.Policies = map[string]config.Policy{"service": {AnyOf: []string{"S-1-5-32-544"}}}
+	next.Policies = map[string]config.Policy{"service": {AnyOf: config.SIDs("S-1-5-32-544")}}
 	if err := s.Reload(&Snapshot{Config: &next, Directory: &fakeDirectory{}}); err != nil {
 		t.Fatal(err)
 	}
@@ -275,5 +275,39 @@ func TestInFlightCheckRetainsPolicySnapshot(t *testing.T) {
 	close(release)
 	if httpStatus(<-done) != 200 {
 		t.Fatal("in-flight policy changed")
+	}
+}
+
+func TestNamedPolicyResolvesOnlyTrustedSelectedGroups(t *testing.T) {
+	allow := config.GroupRef{Name: "Orders Users", Domain: "example.com"}
+	deny := config.GroupRef{Name: "Blocked", Domain: "example.com"}
+	for _, tc := range []struct {
+		name     string
+		resolved map[string]string
+		groups   []string
+		want     int
+	}{
+		{"allow", map[string]string{allow.Key(): group, deny.Key(): "S-1-5-32-544"}, []string{group}, 200},
+		{"deny", map[string]string{allow.Key(): group, deny.Key(): "S-1-5-32-544"}, []string{group, "S-1-5-32-544"}, 403},
+		{"missing deny", map[string]string{allow.Key(): group}, []string{group}, 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &fakeDirectory{fn: func(ctx context.Context, _ Username, _ string, _ func(string) bool) (Identity, error) {
+				refs := RequestedGroups(ctx)
+				if len(refs) != 2 {
+					t.Error("selected policy group references missing")
+				}
+				return Identity{SID: sid, UPN: "alice@example.com", Groups: tc.groups, ResolvedGroups: tc.resolved}, nil
+			}}
+			s, c := testService(t, d)
+			c.Policies["service"] = config.Policy{AnyOf: []config.GroupRef{allow}, DenyAnyOf: []config.GroupRef{deny}}
+			c.Policies["unrelated"] = config.Policy{AnyOf: []config.GroupRef{{Name: "Not This Service", Domain: "example.com"}}}
+			r := request(basic("alice:secret"))
+			r.Attributes.Request.Http.Headers["policy_id"] = "unrelated"
+			resp, _ := s.Check(context.Background(), r)
+			if httpStatus(resp) != tc.want {
+				t.Fatalf("got %d", httpStatus(resp))
+			}
+		})
 	}
 }

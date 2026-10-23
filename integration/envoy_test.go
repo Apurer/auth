@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -36,30 +37,51 @@ type fixtureDirectory struct{}
 
 func (fixtureDirectory) Probe(context.Context) error { return nil }
 func (fixtureDirectory) Authenticate(ctx context.Context, u auth.Username, password string, admit func(string) bool) (auth.Identity, error) {
+	username := strings.TrimSuffix(u.Value, "@example.com")
 	if password != "test-password" {
 		return auth.Identity{}, auth.ErrCredentials
 	}
-	if u.Value == "down" {
+	if username == "down" {
 		return auth.Identity{}, errors.New("directory offline")
 	}
 	if !admit(domain + "-1001") {
 		return auth.Identity{}, auth.ErrRateLimited
 	}
 	groups := []string{domain + "-513"}
-	if u.Value == "alice" {
+	if username == "alice" {
 		groups = append(groups, domain+"-1101")
 	}
-	return auth.Identity{SID: domain + "-1001", UPN: u.Value + "@example.com", Groups: groups}, nil
+	resolved := map[string]string{}
+	for _, ref := range auth.RequestedGroups(ctx) {
+		switch ref.Name {
+		case "Orders Users":
+			resolved[ref.Key()] = domain + "-1101"
+		case "Reports Users":
+			resolved[ref.Key()] = domain + "-1103"
+		default:
+			return auth.Identity{}, auth.ErrDirectory
+		}
+	}
+	return auth.Identity{SID: domain + "-1001", UPN: username + "@example.com", Groups: groups, ResolvedGroups: resolved}, nil
 }
 
 // TestEnvoy exercises the actual example config and a real Envoy process. Only
 // AD is replaced; LDAP transport and protocol behavior have separate tests.
 func TestEnvoy(t *testing.T) {
+	t.Run("mtls", func(t *testing.T) { testEnvoy(t, false) })
+	t.Run("unix_named_groups", func(t *testing.T) { testEnvoy(t, true) })
+}
+
+func testEnvoy(t *testing.T, unix bool) {
 	binary := os.Getenv("ENVOY_BINARY")
 	if binary == "" {
 		t.Skip("set ENVOY_BINARY to run real Envoy integration")
 	}
-	c, err := config.Load("../examples/auth.yaml")
+	configPath := "../examples/auth.yaml"
+	if unix {
+		configPath = "../examples/auth-minimal.yaml"
+	}
+	c, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +95,9 @@ func TestEnvoy(t *testing.T) {
 	authCert := ca.Issue(t, "auth.example.com", true)
 	envoyCert := ca.Issue(t, "envoy.example.com", false)
 	c.Listen = "127.0.0.1:0"
+	if unix {
+		c.Listen = "unix:" + filepath.Join(dir, "a.sock")
+	}
 	c.TLS = config.TLS{Certificate: authCert.CertPath, PrivateKey: authCert.KeyPath, ClientCA: ca.Path, AllowedClientSANs: []string{"envoy.example.com"}}
 	svc := auth.New(&auth.Snapshot{Config: c, Directory: fixtureDirectory{}}, prometheus.NewRegistry(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	grpcServer, err := transport.Server(c)
@@ -81,6 +106,9 @@ func TestEnvoy(t *testing.T) {
 	}
 	listener, err := transport.Listen(c.Listen)
 	if err != nil {
+		if unix && errors.Is(err, syscall.EPERM) {
+			t.Skip("Unix sockets are disabled by this execution environment")
+		}
 		t.Fatal(err)
 	}
 	authv3.RegisterAuthorizationServer(grpcServer, svc)
@@ -103,8 +131,28 @@ func TestEnvoy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authPort := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	authPort := "9001"
+	if !unix {
+		authPort = strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	}
 	text := strings.NewReplacer("/run/secrets/service-cert.pem", cert.CertPath, "/run/secrets/service-key.pem", cert.KeyPath, "/run/secrets/envoy-cert.pem", envoyCert.CertPath, "/run/secrets/envoy-key.pem", envoyCert.KeyPath, "/run/secrets/auth-ca.pem", ca.Path, "port_value: 9001", "port_value: "+authPort, "port_value: 8443", "port_value: "+strconv.Itoa(envoyPort), "port_value: 8080", "port_value: "+port, "port_value: 8081", "port_value: "+port).Replace(string(b))
+	if unix {
+		cluster, err := os.ReadFile("../examples/envoy-unix-cluster.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var lines []string
+		for _, line := range strings.Split(strings.TrimSpace(string(cluster)), "\n") {
+			lines = append(lines, "    "+line)
+		}
+		replacement := strings.ReplaceAll(strings.Join(lines, "\n")+"\n", "/run/envoy-ad-auth/auth.sock", strings.TrimPrefix(c.Listen, "unix:"))
+		start := strings.Index(text, "    - name: ad-auth\n")
+		end := strings.Index(text, "    - name: orders\n")
+		if start < 0 || end < start {
+			t.Fatal("example cluster layout changed")
+		}
+		text = text[:start] + replacement + text[end:]
+	}
 	path := filepath.Join(dir, "envoy.yaml")
 	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
 		t.Fatal(err)
@@ -180,7 +228,11 @@ func TestEnvoy(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&headers); err != nil {
 				t.Fatal(err)
 			}
-			if headers.Get("Authorization") != "" || headers.Get("X-Auth-Extra") != "" || headers.Get("X-Auth-User-Sid") != domain+"-1001" || headers.Get("X-Auth-Group-Sids") != `["`+domain+`-1101"]` {
+			expectedGroups := `["` + domain + `-1101"]`
+			if unix {
+				expectedGroups = "[]"
+			}
+			if headers.Get("Authorization") != "" || headers.Get("X-Auth-Extra") != "" || headers.Get("X-Auth-User-Sid") != domain+"-1001" || headers.Get("X-Auth-Group-Sids") != expectedGroups {
 				t.Fatalf("identity propagation failed: %v", headers)
 			}
 		})
